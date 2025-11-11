@@ -1,0 +1,22 @@
+# Home API
+GET http://localhost:8000/ 
+
+# Authentication API
+### Registration API
+POST http://localhost:8000/api/auth/register
+Content-Type: application/json
+
+{
+  "username": "TestUser",
+  "password": "TestUser@123",
+  "email": "testuser@example.com"
+}
+
+### Login API
+POST http://localhost:8000/api/auth/login
+Content-Type: application/json
+
+{
+  "username": "TestUser",
+  "password": "TestUser@123"
+}
