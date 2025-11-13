@@ -11,17 +11,18 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { RedisSocketService } from './redis-socket.service';
+import { ChatService } from 'src/chat/chat.service';
+import { CreateMessageDto } from 'src/chat/dto/create-message.dto';
+import { Attachment, MessageType } from 'src/chat/schemas/message.schema';
 
 export interface JoinPayload {
   conversationId: string;
 }
 
-export type MessageType = 'text' | 'image' | 'system' | 'reaction';
-
-export interface Attachment {
-  url: string;
-  type?: string;
-  size?: number;
+export interface ClientType extends Socket {
+  data: {
+    userId: string;
+  };
 }
 
 export interface SendMessagePayload {
@@ -72,9 +73,10 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     private jwt: JwtService,
     private redisSvc: RedisSocketService,
+    private chatSvc: ChatService,
   ) {}
 
-  async handleConnection(client: Socket) {
+  async handleConnection(client: ClientType) {
     try {
       const token =
         (client.handshake.auth && (client.handshake.auth.token as string)) ||
@@ -95,7 +97,7 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
           secret: process.env.JWT_SECRET,
         },
       );
-      (client.data as { userId: string }).userId = payload.sub;
+      client.data.userId = payload.sub;
 
       await this.redisSvc.addSocket(payload.sub, client.id);
       await this.redisSvc.setPresence(payload.sub, 'online');
@@ -113,12 +115,11 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
-  async handleDisconnect(client: Socket) {
+  async handleDisconnect(client: ClientType) {
     try {
       const sid = client.id;
       const userId =
-        (client.data as { userId?: string }).userId ||
-        (await this.redisSvc.getSocketUser(sid));
+        client.data.userId || (await this.redisSvc.getSocketUser(sid));
 
       if (userId) {
         await this.redisSvc.removeSocket(sid);
@@ -136,11 +137,12 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('join_conversation')
   async onJoin(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: ClientType,
     @MessageBody() payload: JoinPayload,
   ) {
     const convId = payload.conversationId;
-    // TODO: verify membership via prisma
+    const userId = client.data.userId;
+    await this.chatSvc.ensureMember(convId, userId).catch(() => null);
     await client.join(convId);
     client.emit('joined', { conversationId: convId });
   }
@@ -155,32 +157,60 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('send_message')
-  onMessage(
-    @ConnectedSocket() client: Socket,
+  async onMessage(
+    @ConnectedSocket() client: ClientType,
     @MessageBody()
     payload: SendMessagePayload,
   ) {
-    const userId = (client.data as { userId: string }).userId;
-    const serverMessage = {
-      _id: `srv_${Date.now()}`, // change to mongo id
+    const userId = client.data.userId;
+
+    const createDto: CreateMessageDto = {
       conversationId: payload.conversationId,
+      type: payload.type,
+      content: payload.content,
+      attachments: payload.attachments,
+      tempId: payload.tempId ?? undefined,
       senderId: userId,
-      type: payload.type || 'text',
-      content: payload.content || '',
-      attachments: payload.attachments || [],
-      createdAt: new Date().toISOString(),
-      tempId: payload.tempId ?? null,
     };
-    this.server.to(payload.conversationId).emit('message', serverMessage);
-    // TODO: DB Sync
+
+    try {
+      await this.chatSvc
+        .ensureMember(createDto.conversationId, userId)
+        .catch(() => null);
+
+      const saved = await this.chatSvc.createMessage(createDto);
+      const serverMessage: ServerMessage = {
+        _id: saved._id.toString(),
+        conversationId: saved.conversationId,
+        senderId: saved.senderId,
+        type: saved.type,
+        content: saved.content,
+        attachments: saved.attachments || [],
+        createdAt: (
+          saved as typeof saved & { createdAt: Date }
+        ).createdAt.toISOString(),
+        tempId: createDto.tempId ?? null,
+        metadata: saved.metadata ?? {},
+      };
+
+      this.server.to(saved.conversationId).emit('message', serverMessage);
+
+      // TODO: for each user in conversation update delivery status
+    } catch (error) {
+      this.logger.error('Failed to persist message', error);
+      client.emit('message_error', {
+        tempId: payload.tempId ?? null,
+        error: (error as Error).message || 'save_failed',
+      });
+    }
   }
 
   @SubscribeMessage('typing')
   onTyping(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: ClientType,
     @MessageBody() payload: TypingPayload,
   ) {
-    const userId = (client.data as { userId: string }).userId;
+    const userId = client.data.userId;
     client.to(payload.conversationId).emit('typing', {
       conversationId: payload.conversationId,
       userId,
@@ -190,22 +220,33 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('rtc_offer')
   async onOffer(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: ClientType,
     @MessageBody() payload: RtcOfferPayload,
   ) {
     await this.forwardToUser(payload.to, 'rtc_offer', {
-      from: (client.data as { userId: string }).userId,
+      from: client.data.userId,
+      sdp: payload.sdp,
+    });
+  }
+
+  @SubscribeMessage('rtc_answer')
+  async onAnswer(
+    @ConnectedSocket() client: ClientType,
+    @MessageBody() payload: RtcOfferPayload,
+  ) {
+    await this.forwardToUser(payload.to, 'rtc_answer', {
+      from: client.data.userId,
       sdp: payload.sdp,
     });
   }
 
   @SubscribeMessage('rtc_ice')
   async onIce(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: ClientType,
     @MessageBody() payload: RtcIcePayload,
   ) {
     await this.forwardToUser(payload.to, 'rtc_ice', {
-      from: (client.data as { userId: string }).userId,
+      from: client.data.userId,
       candidate: payload.candidate,
     });
   }
