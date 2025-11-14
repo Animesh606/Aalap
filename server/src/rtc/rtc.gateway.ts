@@ -14,6 +14,8 @@ import { RedisSocketService } from './redis-socket.service';
 import { ChatService } from 'src/chat/chat.service';
 import { CreateMessageDto } from 'src/chat/dto/create-message.dto';
 import { Attachment, MessageType } from 'src/chat/schemas/message.schema';
+import { NotificationService } from 'src/notification/notification.service';
+import { PrismaService } from 'src/prisma/prisma.service';
 
 export interface JoinPayload {
   conversationId: string;
@@ -74,6 +76,8 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private jwt: JwtService,
     private redisSvc: RedisSocketService,
     private chatSvc: ChatService,
+    private notificationSvc: NotificationService,
+    private prisma: PrismaService,
   ) {}
 
   async handleConnection(client: ClientType) {
@@ -195,7 +199,56 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       this.server.to(saved.conversationId).emit('message', serverMessage);
 
-      // TODO: for each user in conversation update delivery status
+      // Deliver all member of the conversation
+      const memberships = await this.prisma.membership.findMany({
+        where: { conversationId: saved.conversationId },
+      });
+      const memberIds = memberships.map((m) => m.userId);
+
+      const deliveryList: string[] = [];
+      const pushQueuedFor: string[] = [];
+
+      for (const memberId of memberIds) {
+        if (memberId === userId) continue;
+        const sockets = await this.redisSvc.getUserSockets(memberId);
+        if (sockets && sockets.length > 0) {
+          // online user: direct send
+          sockets.forEach((sid) =>
+            this.server.to(sid).emit('message', serverMessage),
+          );
+          await this.chatSvc.markDelivered(serverMessage._id, memberId);
+          deliveryList.push(memberId);
+        } else {
+          // offline user: enqueue pushjob
+          await this.notificationSvc.enqueuePush({
+            userId: memberId,
+            title: 'New message',
+            body: serverMessage.content
+              ? serverMessage.content.slice(0, 140)
+              : 'New message',
+            data: {
+              conversationId: serverMessage.conversationId,
+              messageId: serverMessage._id,
+            },
+          });
+          pushQueuedFor.push(memberId);
+        }
+      }
+
+      // Send message_status back to sender
+      const senderSockets = await this.redisSvc.getUserSockets(userId);
+      const statusPayload = {
+        messageId: serverMessage._id,
+        deliveredTo: deliveryList,
+        pushQueuedFor,
+      };
+      if (senderSockets && senderSockets.length > 0) {
+        senderSockets.forEach((sid) => {
+          this.server.to(sid).emit('message_status', statusPayload);
+        });
+      } else {
+        client.emit('message_status', statusPayload);
+      }
     } catch (error) {
       this.logger.error('Failed to persist message', error);
       client.emit('message_error', {
