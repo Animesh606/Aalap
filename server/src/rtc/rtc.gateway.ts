@@ -35,6 +35,11 @@ export interface SendMessagePayload {
   attachments?: Attachment[];
 }
 
+export interface ReadMessagePayload {
+  messageId: string;
+  conversationId: string;
+}
+
 export interface TypingPayload {
   conversationId: string;
   isTyping: boolean;
@@ -69,7 +74,6 @@ export interface ServerMessage {
 @Injectable()
 export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer() server: Server;
-
   private readonly logger = new Logger(RtcGateway.name);
 
   constructor(
@@ -146,7 +150,15 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     const convId = payload.conversationId;
     const userId = client.data.userId;
-    await this.chatSvc.ensureMember(convId, userId).catch(() => null);
+    try {
+      await this.chatSvc.ensureMember(convId, userId);
+    } catch (err) {
+      client.emit('join_error', {
+        conversationId: convId,
+        message: (err as Error).message,
+      });
+      return;
+    }
     await client.join(convId);
     client.emit('joined', { conversationId: convId });
   }
@@ -167,7 +179,6 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
     payload: SendMessagePayload,
   ) {
     const userId = client.data.userId;
-
     const createDto: CreateMessageDto = {
       conversationId: payload.conversationId,
       type: payload.type,
@@ -178,10 +189,10 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
 
     try {
-      await this.chatSvc
-        .ensureMember(createDto.conversationId, userId)
-        .catch(() => null);
+      // Check if user is member of the conversation
+      await this.chatSvc.ensureMember(createDto.conversationId, userId);
 
+      // Message save to database
       const saved = await this.chatSvc.createMessage(createDto);
       const serverMessage: ServerMessage = {
         _id: saved._id.toString(),
@@ -197,6 +208,7 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
         metadata: saved.metadata ?? {},
       };
 
+      // Emit message to current conversation room
       this.server.to(saved.conversationId).emit('message', serverMessage);
 
       // Deliver all member of the conversation
@@ -254,6 +266,50 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.emit('message_error', {
         tempId: payload.tempId ?? null,
         error: (error as Error).message || 'save_failed',
+      });
+    }
+  }
+
+  @SubscribeMessage('message_read')
+  async onMessageRead(
+    @ConnectedSocket() client: ClientType,
+    @MessageBody() payload: ReadMessagePayload,
+  ) {
+    const userId = client.data.userId;
+    if (!payload || !payload.messageId || !payload.conversationId) {
+      client.emit('message_error', { error: 'invalid_read_payload' });
+      return;
+    }
+
+    try {
+      // check if user is member of the conversation room
+      await this.chatSvc.ensureMember(payload.conversationId, userId);
+
+      // update to database
+      await this.chatSvc.markRead(payload.messageId, userId);
+
+      // broadcast event to the room
+      this.server
+        .to(payload.conversationId)
+        .emit('message_read', { messageId: payload.messageId, userId });
+
+      // notify the original sender
+      const msg = await this.chatSvc.getMessageById(payload.messageId);
+      if (msg && msg.senderId) {
+        const senderSockets = await this.redisSvc.getUserSockets(msg.senderId);
+        const statusPayload = {
+          messageId: payload.messageId,
+          readBy: [userId],
+        };
+        if (senderSockets && senderSockets.length > 0) {
+          senderSockets.forEach((sid) =>
+            this.server.to(sid).emit('message_status', statusPayload),
+          );
+        }
+      }
+    } catch (err) {
+      client.emit('message_error', {
+        error: (err as Error).message || 'read_failed',
       });
     }
   }

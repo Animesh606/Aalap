@@ -13,16 +13,12 @@ export class ChatService {
   ) {}
 
   async ensureMember(conversationId: string, userId: string) {
-    try {
-      const membership = await this.prisma.membership.findFirst({
-        where: { conversationId, userId },
-      });
-      if (!membership)
-        throw new BadRequestException('Not a member of conversation');
-    } catch (error) {
-      console.error('member ensure error', error);
-      return;
-    }
+    const membership = await this.prisma.membership.findFirst({
+      where: { conversationId, userId },
+    });
+    if (!membership)
+      throw new BadRequestException('Not a member of conversation');
+    return true;
   }
 
   async createMessage(dto: CreateMessageDto) {
@@ -55,6 +51,10 @@ export class ChatService {
       .limit(limit)
       .lean()
       .exec();
+  }
+
+  async getMessageById(messageId: string) {
+    return this.messageModel.findById(messageId).lean().exec();
   }
 
   async markDelivered(messageId: string, userId: string) {
