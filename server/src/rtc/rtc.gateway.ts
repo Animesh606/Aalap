@@ -16,6 +16,7 @@ import { CreateMessageDto } from 'src/chat/dto/create-message.dto';
 import { Attachment, MessageType } from 'src/chat/schemas/message.schema';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { CallService } from 'src/call/call.service';
 
 export interface JoinPayload {
   conversationId: string;
@@ -43,6 +44,18 @@ export interface ReadMessagePayload {
 export interface TypingPayload {
   conversationId: string;
   isTyping: boolean;
+}
+
+export interface StartCallPayload {
+  conversationId: string;
+  partipants: string[];
+  mode?: 'audio' | 'video';
+}
+
+export interface EndCallPayload {
+  callId: string;
+  conversationId?: string;
+  metadata?: unknown;
 }
 
 export interface RtcOfferPayload {
@@ -82,6 +95,7 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private chatSvc: ChatService,
     private notificationSvc: NotificationService,
     private prisma: PrismaService,
+    private callSvc: CallService,
   ) {}
 
   async handleConnection(client: ClientType) {
@@ -325,6 +339,73 @@ export class RtcGateway implements OnGatewayConnection, OnGatewayDisconnect {
       userId,
       isTyping: payload.isTyping,
     });
+  }
+
+  @SubscribeMessage('start_call')
+  async onStartCall(
+    @ConnectedSocket() client: ClientType,
+    @MessageBody() payload: StartCallPayload,
+  ) {
+    const userId = client.data.userId;
+    try {
+      // membership check
+      await this.chatSvc.ensureMember(payload.conversationId, userId);
+
+      // include host in participants
+      const participants = Array.from(
+        new Set([...(payload.partipants || []), userId]),
+      );
+
+      const call = await this.callSvc.startCall(
+        payload.conversationId,
+        userId,
+        participants,
+        { mode: payload.mode || 'audio' },
+      );
+
+      // notify partipants
+      for (const pid of participants) {
+        const sockets = await this.redisSvc.getUserSockets(pid);
+        if (!sockets || sockets.length === 0) continue;
+        sockets.forEach((sid) =>
+          this.server.to(sid).emit('incoming_call', {
+            callId: call.id,
+            conversationId: payload.conversationId,
+            hostId: userId,
+            mode: payload.mode || 'audio',
+          }),
+        );
+      }
+
+      client.emit('call_started', { callId: call.id });
+    } catch (error) {
+      client.emit('call_error', {
+        message: (error as Error).message || 'start_call_failed',
+      });
+    }
+  }
+
+  @SubscribeMessage('end_call')
+  async onEndCall(
+    @ConnectedSocket() client: ClientType,
+    @MessageBody() payload: EndCallPayload,
+  ) {
+    const userId = client.data.userId;
+    try {
+      const updated = await this.callSvc.endCall(
+        payload.callId,
+        undefined,
+        payload.metadata || {},
+      );
+      this.server
+        .to(payload.conversationId || updated.conversationId)
+        .emit('call_ended', { callId: payload.callId, endedBy: userId });
+      client.emit('call_ended_ack', { callId: payload.callId });
+    } catch (error) {
+      client.emit('call_error', {
+        message: (error as Error).message || 'end_call_failed',
+      });
+    }
   }
 
   @SubscribeMessage('rtc_offer')

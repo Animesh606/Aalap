@@ -27,8 +27,8 @@ model Membership {
   userId          String
   user            User     @relation(fields: [userId], references: [id])
   conversationId  String
-  role      String
-  joinedAt  DateTime @default(now())
+  role            String
+  joinedAt        DateTime @default(now())
   @@unique([userId, conversationId])
 }
 
@@ -39,4 +39,14 @@ model Device {
   deviceToken String   @unique
   platform    String
   createdAt   DateTime @default(now())
+}
+
+model Call {
+  id              String    @id @default(uuid())
+  conversationId  String
+  hostId          String
+  participants    String[]
+  startAt         DateTime  @default(now())
+  endAt           DateTime?
+  metadata        Json?
 }

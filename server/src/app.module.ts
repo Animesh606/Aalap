@@ -9,6 +9,7 @@ import { RtcModule } from './rtc/rtc.module';
 import { ChatModule } from './chat/chat.module';
 import { MongooseModule } from '@nestjs/mongoose';
 import { NotificationModule } from './notification/notification.module';
+import { CallModule } from './call/call.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { NotificationModule } from './notification/notification.module';
     RtcModule,
     ChatModule,
     NotificationModule,
+    CallModule,
   ],
   controllers: [AppController],
   providers: [AppService],
